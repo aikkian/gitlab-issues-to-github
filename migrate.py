@@ -117,6 +117,22 @@ class GitLabClient:
         endpoint = f"/projects/{self.project_id}/labels"
         return list(self._get_paginated(endpoint))
 
+    def get_issue_award_emoji(self, iid):
+        endpoint = f"/projects/{self.project_id}/issues/{iid}/award_emoji"
+        return list(self._get_paginated(endpoint))
+
+    def get_note_award_emoji(self, iid, note_id):
+        endpoint = f"/projects/{self.project_id}/issues/{iid}/notes/{note_id}/award_emoji"
+        return list(self._get_paginated(endpoint))
+
+    def get_issue_links(self, iid):
+        endpoint = f"/projects/{self.project_id}/issues/{iid}/links"
+        return list(self._get_paginated(endpoint))
+
+    def get_related_merge_requests(self, iid):
+        endpoint = f"/projects/{self.project_id}/issues/{iid}/related_merge_requests"
+        return list(self._get_paginated(endpoint))
+
     def get_project(self):
         resp = self.session.get(f"{self.base_url}/projects/{self.project_id}")
         resp.raise_for_status()
@@ -245,6 +261,26 @@ class GitHubClient:
         self._request("POST", f"/repos/{self.owner}/{self.repo}/issues/{issue_number}/comments",
                        json={"body": body})
 
+    def add_reaction(self, issue_number, reaction, comment_id=None):
+        if DRY_RUN:
+            log.info("[DRY RUN] Would add reaction %s to issue #%d", reaction, issue_number)
+            return
+        if comment_id:
+            endpoint = f"/repos/{self.owner}/{self.repo}/issues/comments/{comment_id}/reactions"
+        else:
+            endpoint = f"/repos/{self.owner}/{self.repo}/issues/{issue_number}/reactions"
+        resp = self.session.request(
+            "POST", f"{self.API}{endpoint}",
+            json={"content": reaction},
+            headers={"Accept": "application/vnd.github.squirrel-girl-preview+json"},
+        )
+        # 422 means reaction already exists or is invalid — not fatal
+        if resp.status_code == 422:
+            return
+        if resp.status_code in (200, 201):
+            return
+        log.warning("Failed to add reaction %s: %s", reaction, resp.status_code)
+
     def close_issue(self, issue_number):
         if DRY_RUN:
             log.info("[DRY RUN] Would close issue #%d", issue_number)
@@ -256,6 +292,26 @@ class GitHubClient:
 # ---------------------------------------------------------------------------
 # Content transformation
 # ---------------------------------------------------------------------------
+
+
+# GitLab emoji name -> GitHub reaction content
+# GitHub only supports: +1, -1, laugh, confused, heart, hooray, rocket, eyes
+GITLAB_TO_GITHUB_EMOJI = {
+    "thumbsup": "+1",
+    "thumbsdown": "-1",
+    "laughing": "laugh",
+    "smiley": "laugh",
+    "confused": "confused",
+    "heart": "heart",
+    "tada": "hooray",
+    "rocket": "rocket",
+    "eyes": "eyes",
+    "100": "+1",
+    "clap": "hooray",
+    "fire": "hooray",
+    "star": "hooray",
+    "thinking": "confused",
+}
 
 
 def map_username(match):
@@ -281,7 +337,8 @@ def convert_body(body, gitlab_project_path=""):
     return body
 
 
-def format_issue_body(issue, gitlab_project_path=""):
+def format_issue_body(issue, gitlab_project_path="", linked_issues=None,
+                      related_mrs=None):
     author = issue.get("author", {})
     author_name = author.get("name", "Unknown")
     author_username = author.get("username", "unknown")
@@ -292,6 +349,56 @@ def format_issue_body(issue, gitlab_project_path=""):
         f"originally created by **{author_name}** (`@{author_username}`) on {created_at}*\n\n"
     )
     body = convert_body(issue.get("description", ""), gitlab_project_path)
+
+    # --- Metadata table ---
+    metadata_rows = []
+    if issue.get("due_date"):
+        metadata_rows.append(f"| Due date | {issue['due_date']} |")
+    if issue.get("weight"):
+        metadata_rows.append(f"| Weight | {issue['weight']} |")
+    time_stats = issue.get("time_stats", {})
+    if time_stats.get("human_time_estimate"):
+        metadata_rows.append(f"| Time estimate | {time_stats['human_time_estimate']} |")
+    if time_stats.get("human_total_time_spent"):
+        metadata_rows.append(f"| Time spent | {time_stats['human_total_time_spent']} |")
+    if issue.get("confidential"):
+        metadata_rows.append("| Confidential | Yes |")
+    if issue.get("state") == "closed":
+        closed_by = issue.get("closed_by", {})
+        closed_at = issue.get("closed_at", "")[:10] if issue.get("closed_at") else ""
+        closed_name = closed_by.get("name", "Unknown") if closed_by else "Unknown"
+        closed_username = closed_by.get("username", "") if closed_by else ""
+        closer = f"**{closed_name}** (`@{closed_username}`)" if closed_username else closed_name
+        metadata_rows.append(f"| Closed by | {closer} on {closed_at} |")
+    if issue.get("updated_at"):
+        metadata_rows.append(f"| Last updated | {issue['updated_at'][:10]} |")
+
+    if metadata_rows:
+        body += "\n\n---\n\n### GitLab Metadata\n\n| Field | Value |\n|---|---|\n"
+        body += "\n".join(metadata_rows)
+
+    # --- Linked issues ---
+    if linked_issues:
+        body += "\n\n### Linked Issues\n\n"
+        for link in linked_issues:
+            link_type = link.get("link_type", "relates_to")
+            ref = link.get("references", {}).get("full", f"#{link.get('iid', '?')}")
+            link_title = link.get("title", "")
+            body += f"- **{link_type}**: {ref} — {link_title}\n"
+
+    # --- Related merge requests ---
+    if related_mrs:
+        body += "\n\n### Related Merge Requests\n\n"
+        for mr in related_mrs:
+            ref = mr.get("references", {}).get("full", f"!{mr.get('iid', '?')}")
+            mr_title = mr.get("title", "")
+            mr_state = mr.get("state", "")
+            mr_url = mr.get("web_url", "")
+            if mr_url:
+                body += f"- [{ref}]({mr_url}) ({mr_state}) — {mr_title}\n"
+            else:
+                body += f"- {ref} ({mr_state}) — {mr_title}\n"
+
     return header + body
 
 
@@ -379,8 +486,22 @@ def migrate():
                 github.ensure_label(lbl, color=details.get("color"),
                                     description=details.get("description"))
 
+            # Fetch linked issues and related merge requests
+            linked_issues = []
+            related_mrs = []
+            try:
+                linked_issues = gitlab.get_issue_links(iid)
+            except Exception:
+                log.warning("  Could not fetch linked issues for #%d", iid)
+            try:
+                related_mrs = gitlab.get_related_merge_requests(iid)
+            except Exception:
+                log.warning("  Could not fetch related MRs for #%d", iid)
+
             # Build body
-            body = format_issue_body(issue, project_path)
+            body = format_issue_body(issue, project_path,
+                                     linked_issues=linked_issues,
+                                     related_mrs=related_mrs)
 
             # Resolve milestone
             milestone_number = None
@@ -403,11 +524,44 @@ def migrate():
                 assignees=assignees,
             )
 
-            # Migrate comments
+            # Migrate issue-level reactions
+            try:
+                issue_emoji = gitlab.get_issue_award_emoji(iid)
+                for emoji in issue_emoji:
+                    gh_reaction = GITLAB_TO_GITHUB_EMOJI.get(emoji.get("name"))
+                    if gh_reaction:
+                        github.add_reaction(gh_issue_number, gh_reaction)
+                if issue_emoji:
+                    log.info("  Added %d reactions to issue", len(issue_emoji))
+            except Exception:
+                log.warning("  Could not fetch reactions for issue #%d", iid)
+
+            # Migrate comments and their reactions
             notes = gitlab.get_issue_notes(iid)
             for note in notes:
                 comment_body = format_comment(note, project_path)
                 github.add_comment(gh_issue_number, comment_body)
+
+                # Migrate comment-level reactions
+                try:
+                    note_emoji = gitlab.get_note_award_emoji(iid, note["id"])
+                    if note_emoji:
+                        # Get the comment ID from GitHub (last comment on the issue)
+                        resp = github.session.get(
+                            f"{github.API}/repos/{github.owner}/{github.repo}"
+                            f"/issues/{gh_issue_number}/comments",
+                            params={"per_page": 1, "page": 1,
+                                    "sort": "created", "direction": "desc"},
+                        )
+                        if resp.status_code == 200 and resp.json():
+                            gh_comment_id = resp.json()[0]["id"]
+                            for emoji in note_emoji:
+                                gh_reaction = GITLAB_TO_GITHUB_EMOJI.get(emoji.get("name"))
+                                if gh_reaction:
+                                    github.add_reaction(gh_issue_number, gh_reaction,
+                                                        comment_id=gh_comment_id)
+                except Exception:
+                    log.warning("  Could not migrate reactions for note %d", note["id"])
 
             if notes:
                 log.info("  Added %d comments", len(notes))
