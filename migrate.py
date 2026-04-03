@@ -28,7 +28,11 @@ GITLAB_TOKEN = os.getenv("GITLAB_TOKEN", "")
 GITLAB_PROJECT_ID = os.getenv("GITLAB_PROJECT_ID", "")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 GITHUB_REPO = os.getenv("GITHUB_REPO", "")
-USERNAME_MAP = json.loads(os.getenv("USERNAME_MAP", "{}"))
+try:
+    USERNAME_MAP = json.loads(os.getenv("USERNAME_MAP", "{}"))
+except json.JSONDecodeError:
+    log.error("USERNAME_MAP environment variable contains invalid JSON.")
+    sys.exit(1)
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
 STATE_FILE = os.getenv("MIGRATION_STATE_FILE", ".migration_state.json")
 
@@ -156,8 +160,10 @@ class GitHubClient:
         })
         self._label_cache = set()
         self._milestone_cache = {}  # title -> number
+        self._milestones_fetched = False
 
     def _request(self, method, endpoint, **kwargs):
+        allow_404 = kwargs.pop("allow_404", False)
         url = f"{self.API}{endpoint}"
         while True:
             resp = self.session.request(method, url, **kwargs)
@@ -176,6 +182,9 @@ class GitHubClient:
                 continue
             if resp.status_code == 422:
                 log.error("GitHub validation error: %s", resp.text)
+            # Return response without raising for expected non-error codes
+            if allow_404 and resp.status_code == 404:
+                return resp
             resp.raise_for_status()
             # Throttle writes to avoid abuse detection
             if method.upper() in ("POST", "PATCH", "PUT"):
@@ -186,7 +195,7 @@ class GitHubClient:
         if name in self._label_cache:
             return
         endpoint = f"/repos/{self.owner}/{self.repo}/labels/{requests.utils.quote(name, safe='')}"
-        check = self.session.get(f"{self.API}{endpoint}")
+        check = self._request("GET", endpoint, allow_404=True)
         if check.status_code == 200:
             self._label_cache.add(name)
             return
@@ -205,8 +214,8 @@ class GitHubClient:
     def ensure_milestone(self, title, description=None, due_on=None, state=None):
         if title in self._milestone_cache:
             return self._milestone_cache[title]
-        # Fetch existing milestones
-        if not self._milestone_cache:
+        # Fetch existing milestones (once)
+        if not self._milestones_fetched:
             page = 1
             while True:
                 resp = self.session.get(
@@ -220,6 +229,7 @@ class GitHubClient:
                 for m in items:
                     self._milestone_cache[m["title"]] = m["number"]
                 page += 1
+            self._milestones_fetched = True
         if title in self._milestone_cache:
             return self._milestone_cache[title]
         if DRY_RUN:
@@ -257,9 +267,10 @@ class GitHubClient:
     def add_comment(self, issue_number, body):
         if DRY_RUN:
             log.info("[DRY RUN] Would add comment to issue #%d", issue_number)
-            return
-        self._request("POST", f"/repos/{self.owner}/{self.repo}/issues/{issue_number}/comments",
+            return None
+        resp = self._request("POST", f"/repos/{self.owner}/{self.repo}/issues/{issue_number}/comments",
                        json={"body": body})
+        return resp.json()["id"]
 
     def add_reaction(self, issue_number, reaction, comment_id=None):
         if DRY_RUN:
@@ -269,17 +280,19 @@ class GitHubClient:
             endpoint = f"/repos/{self.owner}/{self.repo}/issues/comments/{comment_id}/reactions"
         else:
             endpoint = f"/repos/{self.owner}/{self.repo}/issues/{issue_number}/reactions"
-        resp = self.session.request(
-            "POST", f"{self.API}{endpoint}",
-            json={"content": reaction},
-            headers={"Accept": "application/vnd.github.squirrel-girl-preview+json"},
-        )
-        # 422 means reaction already exists or is invalid — not fatal
-        if resp.status_code == 422:
-            return
-        if resp.status_code in (200, 201):
-            return
-        log.warning("Failed to add reaction %s: %s", reaction, resp.status_code)
+        # Temporarily override Accept header for reactions API
+        original_accept = self.session.headers.get("Accept")
+        self.session.headers["Accept"] = "application/vnd.github.squirrel-girl-preview+json"
+        try:
+            self._request("POST", endpoint, json={"content": reaction})
+        except requests.HTTPError as e:
+            # 422 means reaction already exists or is invalid — not fatal
+            if e.response is not None and e.response.status_code == 422:
+                pass
+            else:
+                log.warning("Failed to add reaction %s: %s", reaction, e)
+        finally:
+            self.session.headers["Accept"] = original_accept
 
     def close_issue(self, issue_number):
         if DRY_RUN:
@@ -325,8 +338,8 @@ def map_username(match):
 def convert_body(body, gitlab_project_path=""):
     if not body:
         return ""
-    # Map @username references
-    body = re.sub(r"@(\w+)", map_username, body)
+    # Map @username references (negative lookbehind avoids matching emails like user@domain)
+    body = re.sub(r"(?<!\w)@(\w+)", map_username, body)
     # Convert relative GitLab upload paths to absolute URLs
     if gitlab_project_path:
         body = re.sub(
@@ -540,28 +553,19 @@ def migrate():
             notes = gitlab.get_issue_notes(iid)
             for note in notes:
                 comment_body = format_comment(note, project_path)
-                github.add_comment(gh_issue_number, comment_body)
+                gh_comment_id = github.add_comment(gh_issue_number, comment_body)
 
                 # Migrate comment-level reactions
-                try:
-                    note_emoji = gitlab.get_note_award_emoji(iid, note["id"])
-                    if note_emoji:
-                        # Get the comment ID from GitHub (last comment on the issue)
-                        resp = github.session.get(
-                            f"{github.API}/repos/{github.owner}/{github.repo}"
-                            f"/issues/{gh_issue_number}/comments",
-                            params={"per_page": 1, "page": 1,
-                                    "sort": "created", "direction": "desc"},
-                        )
-                        if resp.status_code == 200 and resp.json():
-                            gh_comment_id = resp.json()[0]["id"]
-                            for emoji in note_emoji:
-                                gh_reaction = GITLAB_TO_GITHUB_EMOJI.get(emoji.get("name"))
-                                if gh_reaction:
-                                    github.add_reaction(gh_issue_number, gh_reaction,
-                                                        comment_id=gh_comment_id)
-                except Exception:
-                    log.warning("  Could not migrate reactions for note %d", note["id"])
+                if gh_comment_id:
+                    try:
+                        note_emoji = gitlab.get_note_award_emoji(iid, note["id"])
+                        for emoji in note_emoji:
+                            gh_reaction = GITLAB_TO_GITHUB_EMOJI.get(emoji.get("name"))
+                            if gh_reaction:
+                                github.add_reaction(gh_issue_number, gh_reaction,
+                                                    comment_id=gh_comment_id)
+                    except Exception:
+                        log.warning("  Could not migrate reactions for note %d", note["id"])
 
             if notes:
                 log.info("  Added %d comments", len(notes))
