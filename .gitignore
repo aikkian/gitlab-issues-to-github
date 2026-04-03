@@ -1,0 +1,5 @@
+.env
+.migration_state.json
+__pycache__/
+*.pyc
+*.pyo
