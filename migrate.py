@@ -107,12 +107,15 @@ class GitLabClient:
 
     def get_issue_notes(self, iid):
         endpoint = f"/projects/{self.project_id}/issues/{iid}/notes"
-        notes = list(self._get_paginated(endpoint, {"sort": "asc", "order_by": "created_at"}))
-        return [n for n in notes if not n.get("system", False)]
+        return list(self._get_paginated(endpoint, {"sort": "asc", "order_by": "created_at"}))
 
     def get_milestones(self):
         endpoint = f"/projects/{self.project_id}/milestones"
         return list(self._get_paginated(endpoint, {"state": "all"}))
+
+    def get_labels(self):
+        endpoint = f"/projects/{self.project_id}/labels"
+        return list(self._get_paginated(endpoint))
 
     def get_project(self):
         resp = self.session.get(f"{self.base_url}/projects/{self.project_id}")
@@ -163,7 +166,7 @@ class GitHubClient:
                 time.sleep(1)
             return resp
 
-    def ensure_label(self, name, color=None):
+    def ensure_label(self, name, color=None, description=None):
         if name in self._label_cache:
             return
         endpoint = f"/repos/{self.owner}/{self.repo}/labels/{requests.utils.quote(name, safe='')}"
@@ -172,14 +175,16 @@ class GitHubClient:
             self._label_cache.add(name)
             return
         if DRY_RUN:
-            log.info("[DRY RUN] Would create label: %s", name)
+            log.info("[DRY RUN] Would create label: %s (color=%s)", name, color)
             self._label_cache.add(name)
             return
         gh_color = (color or "#ededed").lstrip("#")
-        self._request("POST", f"/repos/{self.owner}/{self.repo}/labels",
-                       json={"name": name, "color": gh_color})
+        payload = {"name": name, "color": gh_color}
+        if description:
+            payload["description"] = description[:100]  # GitHub limits to 100 chars
+        self._request("POST", f"/repos/{self.owner}/{self.repo}/labels", json=payload)
         self._label_cache.add(name)
-        log.info("Created label: %s", name)
+        log.info("Created label: %s (color=#%s)", name, gh_color)
 
     def ensure_milestone(self, title, description=None, due_on=None, state=None):
         if title in self._milestone_cache:
@@ -295,10 +300,12 @@ def format_comment(note, gitlab_project_path=""):
     author_name = author.get("name", "Unknown")
     author_username = author.get("username", "unknown")
     created_at = note.get("created_at", "")[:10]
+    is_system = note.get("system", False)
 
-    header = (
-        f"> **{author_name}** (`@{author_username}`) commented on {created_at}:\n\n"
-    )
+    if is_system:
+        header = f"> *System event by **{author_name}** on {created_at}:*\n\n"
+    else:
+        header = f"> **{author_name}** (`@{author_username}`) commented on {created_at}:\n\n"
     body = convert_body(note.get("body", ""), gitlab_project_path)
     return header + body
 
@@ -322,6 +329,17 @@ def migrate():
     project = gitlab.get_project()
     project_path = project.get("path_with_namespace", "")
     log.info("GitLab project: %s", project_path)
+
+    # --- Pre-fetch GitLab labels (for colors and descriptions) ---
+    log.info("Fetching GitLab labels...")
+    gl_labels = gitlab.get_labels()
+    label_details = {}  # name -> {color, description}
+    for lbl in gl_labels:
+        label_details[lbl["name"]] = {
+            "color": lbl.get("color"),
+            "description": lbl.get("description"),
+        }
+    log.info("Found %d GitLab labels", len(label_details))
 
     # --- Pre-create milestones ---
     log.info("Syncing milestones...")
@@ -354,10 +372,12 @@ def migrate():
         try:
             log.info("Migrating issue #%d: %s", iid, title)
 
-            # Ensure labels
+            # Ensure labels (with original colors and descriptions from GitLab)
             label_names = [lbl for lbl in issue.get("labels", [])]
             for lbl in label_names:
-                github.ensure_label(lbl)
+                details = label_details.get(lbl, {})
+                github.ensure_label(lbl, color=details.get("color"),
+                                    description=details.get("description"))
 
             # Build body
             body = format_issue_body(issue, project_path)
