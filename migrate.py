@@ -36,6 +36,20 @@ except json.JSONDecodeError:
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
 STATE_FILE = os.getenv("MIGRATION_STATE_FILE", ".migration_state.json")
 
+# Default colors for GitLab scoped labels (scope prefix -> hex color)
+# Used as fallback when GitLab label has no color or for consistent grouping
+SCOPE_COLORS = {
+    "x-priority": "d93f0b",   # red
+    "x-type": "0075ca",       # blue
+    "x-team": "0e8a16",       # green
+    "x-workflow": "5319e7",    # purple
+    "status": "fbca04",        # yellow
+}
+try:
+    SCOPE_COLORS.update(json.loads(os.getenv("SCOPE_COLORS", "{}")))
+except json.JSONDecodeError:
+    log.warning("SCOPE_COLORS contains invalid JSON, using defaults.")
+
 
 def validate_config():
     missing = []
@@ -203,7 +217,11 @@ class GitHubClient:
             log.info("[DRY RUN] Would create label: %s (color=%s)", name, color)
             self._label_cache.add(name)
             return
-        gh_color = (color or "#ededed").lstrip("#")
+        gh_color = (color or "").lstrip("#")
+        # Use scope-based color for scoped labels (e.g. "x-priority :: P1")
+        if not gh_color or gh_color == "ededed":
+            scope = name.split("::")[0].strip() if "::" in name else ""
+            gh_color = SCOPE_COLORS.get(scope, "ededed")
         payload = {"name": name, "color": gh_color}
         if description:
             payload["description"] = description[:100]  # GitHub limits to 100 chars

@@ -30,6 +30,7 @@ cp .env.example .env
 | `GITHUB_TOKEN` | Yes | GitHub personal access token |
 | `GITHUB_REPO` | Yes | Target repo in `owner/repo` format |
 | `USERNAME_MAP` | No | JSON mapping GitLab to GitHub usernames |
+| `SCOPE_COLORS` | No | JSON mapping scoped label prefixes to hex colors |
 | `DRY_RUN` | No | Set to `1` to preview without making changes |
 
 ## Usage
@@ -59,6 +60,43 @@ Unmapped usernames are wrapped in backticks in issue bodies to prevent false Git
 ## Idempotency
 
 The script tracks migrated issues in `.migration_state.json`. If the migration is interrupted, re-run the script — already-migrated issues will be skipped automatically.
+
+## Scoped Label Colors
+
+GitLab scoped labels (e.g. `x-priority :: P1`, `x-team :: workforce-sales`) are migrated as GitHub labels with consistent colors per scope. Default colors:
+
+| Scope | Color | Hex |
+|---|---|---|
+| `x-priority` | Red | `d93f0b` |
+| `x-type` | Blue | `0075ca` |
+| `x-team` | Green | `0e8a16` |
+| `x-workflow` | Purple | `5319e7` |
+| `status` | Yellow | `fbca04` |
+
+Override or extend with `SCOPE_COLORS`:
+
+```
+SCOPE_COLORS={"x-priority": "e11d48", "Enterprise": "f97316"}
+```
+
+If the GitLab label already has a non-default color, that color is preserved.
+
+## GitLab to GitHub Feature Mapping
+
+| GitLab | GitHub | Notes |
+|---|---|---|
+| Issues | Issues | Full migration with metadata |
+| Scoped labels (`x-priority :: P1`) | Labels (color-grouped) | Visually organized by scope color |
+| Milestones | Milestones | Title, description, due date, state |
+| Issue comments | Issue comments | Author attribution preserved |
+| System notes | Issue comments (marked) | Label changes, assignments, etc. |
+| Award emoji | Reactions | Mapped to GitHub's supported set |
+| Issue links | Cross-references in body | Blocks, relates to, etc. |
+| Linked MRs | Links in body | With URL, state, and title |
+| Due date, weight, time tracking | Metadata table in body | GitHub has no native fields for these |
+| Confidential issues | Noted in metadata table | GitHub has no confidential flag |
+| Assignees | Assignees | Must be repo collaborators |
+| Issue state (open/closed) | Issue state | Including closed-by info |
 
 ## Limitations
 
