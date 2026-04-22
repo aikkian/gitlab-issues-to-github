@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Migrate GitLab issues to GitHub, preserving labels, milestones, comments, and state."""
 
+import base64
 import json
 import logging
 import os
@@ -34,6 +35,7 @@ except json.JSONDecodeError:
     log.error("USERNAME_MAP environment variable contains invalid JSON.")
     sys.exit(1)
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
+MIGRATE_IMAGES = os.getenv("MIGRATE_IMAGES", "1") == "1"
 STATE_FILE = os.getenv("MIGRATION_STATE_FILE", ".migration_state.json")
 
 # Default colors for GitLab scoped labels (scope prefix -> hex color)
@@ -150,6 +152,15 @@ class GitLabClient:
     def get_related_merge_requests(self, iid):
         endpoint = f"/projects/{self.project_id}/issues/{iid}/related_merge_requests"
         return list(self._get_paginated(endpoint))
+
+    def download_upload(self, project_path, upload_path):
+        """Download a file from GitLab uploads. Returns (bytes, content_type) or (None, None)."""
+        url = f"{self.base_url.rsplit('/api/v4', 1)[0]}/{project_path}{upload_path}"
+        resp = self.session.get(url, stream=True)
+        if resp.status_code == 200:
+            return resp.content, resp.headers.get("Content-Type", "application/octet-stream")
+        log.warning("  Failed to download %s: %s", upload_path, resp.status_code)
+        return None, None
 
     def get_project(self):
         resp = self.session.get(f"{self.base_url}/projects/{self.project_id}")
@@ -312,6 +323,23 @@ class GitHubClient:
         finally:
             self.session.headers["Accept"] = original_accept
 
+    def upload_file(self, repo_path, content_bytes, commit_message="Upload migrated asset"):
+        """Upload a file to the repo via the Contents API. Returns the raw download URL."""
+        if DRY_RUN:
+            log.info("[DRY RUN] Would upload file: %s", repo_path)
+            return f"https://raw.githubusercontent.com/{self.owner}/{self.repo}/main/{repo_path}"
+        encoded = base64.b64encode(content_bytes).decode("ascii")
+        # Check if file already exists (idempotent)
+        endpoint = f"/repos/{self.owner}/{self.repo}/contents/{repo_path}"
+        check = self._request("GET", endpoint, allow_404=True)
+        if check.status_code == 200:
+            return check.json().get("download_url", "")
+        resp = self._request("PUT", endpoint, json={
+            "message": commit_message,
+            "content": encoded,
+        })
+        return resp.json().get("content", {}).get("download_url", "")
+
     def close_issue(self, issue_number):
         if DRY_RUN:
             log.info("[DRY RUN] Would close issue #%d", issue_number)
@@ -353,13 +381,63 @@ def map_username(match):
     return f"`@{gl_user}`"
 
 
-def convert_body(body, gitlab_project_path=""):
+# Cache for uploaded images: gitlab upload path -> github raw URL
+_image_cache = {}
+
+
+def migrate_uploads_in_text(body, gitlab_project_path, gitlab_client, github_client):
+    """Find GitLab upload references, download and re-upload to GitHub, rewrite URLs."""
+    if not body or not gitlab_project_path:
+        return body
+
+    upload_pattern = re.compile(r"(/uploads/([a-f0-9]{32})/([^\s)]+))")
+
+    def replace_upload(match):
+        upload_path = match.group(1)  # /uploads/hash/filename
+        upload_hash = match.group(2)
+        filename = match.group(3)
+
+        # Check cache first
+        if upload_path in _image_cache:
+            return _image_cache[upload_path]
+
+        # Download from GitLab
+        content, _ = gitlab_client.download_upload(gitlab_project_path, upload_path)
+        if content is None:
+            # Fallback: use absolute GitLab URL
+            fallback = f"{GITLAB_URL}/{gitlab_project_path}{upload_path}"
+            _image_cache[upload_path] = fallback
+            return fallback
+
+        # Upload to GitHub repo
+        repo_path = f".github/migration-assets/{upload_hash}/{filename}"
+        github_url = github_client.upload_file(
+            repo_path, content,
+            commit_message=f"Upload migrated asset: {filename}",
+        )
+        if github_url:
+            _image_cache[upload_path] = github_url
+            log.info("    Migrated upload: %s -> %s", filename, repo_path)
+            return github_url
+
+        # Fallback if upload failed
+        fallback = f"{GITLAB_URL}/{gitlab_project_path}{upload_path}"
+        _image_cache[upload_path] = fallback
+        return fallback
+
+    return upload_pattern.sub(replace_upload, body)
+
+
+def convert_body(body, gitlab_project_path="", gitlab_client=None, github_client=None):
     if not body:
         return ""
     # Map @username references (negative lookbehind avoids matching emails like user@domain)
     body = re.sub(r"(?<!\w)@(\w+)", map_username, body)
-    # Convert relative GitLab upload paths to absolute URLs
-    if gitlab_project_path:
+    # Migrate uploads: download from GitLab, upload to GitHub, rewrite URLs
+    if MIGRATE_IMAGES and gitlab_client and github_client:
+        body = migrate_uploads_in_text(body, gitlab_project_path, gitlab_client, github_client)
+    elif gitlab_project_path:
+        # Fallback: just convert to absolute GitLab URLs
         body = re.sub(
             r"(/uploads/[a-f0-9]{32}/[^\s)]+)",
             rf"{GITLAB_URL}/{gitlab_project_path}\1",
@@ -369,7 +447,7 @@ def convert_body(body, gitlab_project_path=""):
 
 
 def format_issue_body(issue, gitlab_project_path="", linked_issues=None,
-                      related_mrs=None):
+                      related_mrs=None, gitlab_client=None, github_client=None):
     author = issue.get("author", {})
     author_name = author.get("name", "Unknown")
     author_username = author.get("username", "unknown")
@@ -379,7 +457,8 @@ def format_issue_body(issue, gitlab_project_path="", linked_issues=None,
         f"> *Migrated from GitLab issue #{issue['iid']}, "
         f"originally created by **{author_name}** (`@{author_username}`) on {created_at}*\n\n"
     )
-    body = convert_body(issue.get("description", ""), gitlab_project_path)
+    body = convert_body(issue.get("description", ""), gitlab_project_path,
+                        gitlab_client, github_client)
 
     # --- Metadata table ---
     metadata_rows = []
@@ -433,7 +512,7 @@ def format_issue_body(issue, gitlab_project_path="", linked_issues=None,
     return header + body
 
 
-def format_comment(note, gitlab_project_path=""):
+def format_comment(note, gitlab_project_path="", gitlab_client=None, github_client=None):
     author = note.get("author", {})
     author_name = author.get("name", "Unknown")
     author_username = author.get("username", "unknown")
@@ -444,7 +523,8 @@ def format_comment(note, gitlab_project_path=""):
         header = f"> *System event by **{author_name}** on {created_at}:*\n\n"
     else:
         header = f"> **{author_name}** (`@{author_username}`) commented on {created_at}:\n\n"
-    body = convert_body(note.get("body", ""), gitlab_project_path)
+    body = convert_body(note.get("body", ""), gitlab_project_path,
+                        gitlab_client, github_client)
     return header + body
 
 
@@ -532,7 +612,9 @@ def migrate():
             # Build body
             body = format_issue_body(issue, project_path,
                                      linked_issues=linked_issues,
-                                     related_mrs=related_mrs)
+                                     related_mrs=related_mrs,
+                                     gitlab_client=gitlab,
+                                     github_client=github)
 
             # Resolve milestone
             milestone_number = None
@@ -570,7 +652,9 @@ def migrate():
             # Migrate comments and their reactions
             notes = gitlab.get_issue_notes(iid)
             for note in notes:
-                comment_body = format_comment(note, project_path)
+                comment_body = format_comment(note, project_path,
+                                              gitlab_client=gitlab,
+                                              github_client=github)
                 gh_comment_id = github.add_comment(gh_issue_number, comment_body)
 
                 # Migrate comment-level reactions

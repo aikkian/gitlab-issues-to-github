@@ -31,6 +31,7 @@ cp .env.example .env
 | `GITHUB_REPO` | Yes | Target repo in `owner/repo` format |
 | `USERNAME_MAP` | No | JSON mapping GitLab to GitHub usernames |
 | `SCOPE_COLORS` | No | JSON mapping scoped label prefixes to hex colors |
+| `MIGRATE_IMAGES` | No | Set to `0` to skip image migration (default: `1`) |
 | `DRY_RUN` | No | Set to `1` to preview without making changes |
 
 ## Usage
@@ -97,10 +98,21 @@ If the GitLab label already has a non-default color, that color is preserved.
 | Confidential issues | Noted in metadata table | GitHub has no confidential flag |
 | Assignees | Assignees | Must be repo collaborators |
 | Issue state (open/closed) | Issue state | Including closed-by info |
+| Images & file attachments | Uploaded to repo | Stored in `.github/migration-assets/`, URLs rewritten |
+
+## Image Migration
+
+By default (`MIGRATE_IMAGES=1`), images and file attachments embedded in GitLab issues and comments are:
+
+1. **Downloaded** from GitLab using the authenticated API
+2. **Uploaded** to the GitHub repo under `.github/migration-assets/{hash}/{filename}`
+3. **URL-rewritten** in the issue/comment markdown so they render on GitHub
+
+This ensures images remain accessible even if the GitLab instance goes offline or is private. Duplicate uploads (same image in multiple issues) are cached and only uploaded once.
+
+Set `MIGRATE_IMAGES=0` to skip this and use absolute GitLab URLs instead (images will break if GitLab is private or removed).
 
 ## Limitations
-
-- **Images**: GitLab upload paths are converted to absolute URLs. If the GitLab project is private, images won't render for unauthenticated users.
 - **Assignees**: GitHub assignees must be collaborators on the target repository. Unrecognized assignees are silently ignored by the GitHub API.
 - **Issue numbers**: GitHub issue numbers won't match GitLab IIDs. Each migrated issue includes the original GitLab issue number in its header.
 - **Comments**: All comments are created by the token owner. Original author attribution is preserved in the comment body.
